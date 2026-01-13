@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tonie-storymaker"
+version = "0.1.0"
+description = "Voice-cloned story-to-mp3 generator with optional Tonies web upload automation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "python-dotenv>=1.0.0",
+  "numpy>=1.23",
+  "sounddevice>=0.4.6",
+  "scipy>=1.10",
+  "soundfile>=0.12.1",
+  "pydub>=0.25.1",
+  "TTS>=0.22.0",
+  "playwright>=1.42.0",
+]
+
+[project.scripts]
+tonie-storymaker = "tonie_storymaker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tonie_storymaker*"]
+exclude = ["output*", "stories*"]
