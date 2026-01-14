@@ -4,7 +4,8 @@ sounddevice>=0.4.6
 scipy>=1.10
 soundfile>=0.12.1
 pydub>=0.25.1
-TTS>=0.22.0
+git+https://github.com/resemble-ai/chatterbox.git
+torchaudio
 playwright>=1.42.0
-torchcodec
+torchvision
 tqdm>=4.66.0

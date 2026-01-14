@@ -12,6 +12,12 @@ def _get_bool(name: str, default: bool) -> bool:
         return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
+def _get_optional_float(name: str) -> float | None:
+    v = os.getenv(name)
+    if v is None or not v.strip():
+        return None
+    return float(v.strip())
+
 @dataclass(frozen=True)
 class Settings:
     app_data_dir: Path
@@ -26,15 +32,15 @@ class Settings:
     silence_fade_ms: int
 
     # tts
-    tts_model: str
     default_language: str
     tts_use_gpu: bool
-    tts_strip_punctuation: bool
+    tts_min_gpu_vram_gb: float
     tts_max_chars: int
-    tts_workers: int
-    tts_gpu_queue_share: float
-    tts_gpu_min_chars: int
-    tts_batch_max_chars: int
+    tts_tone: str
+    tts_tone_cfg_weight: float | None
+    tts_tone_exaggeration: float | None
+    tts_chatterbox_variant: str
+    tts_chunk_silence_ms: int
     chapter_split_keywords: List[str]
 
     # tonies / playwright
@@ -67,15 +73,15 @@ def get_settings() -> Settings:
         silence_thresh_db=float(os.getenv("SILENCE_THRESH_DB", "-40.0")),
         silence_fade_ms=int(os.getenv("SILENCE_FADE_MS", "40")),
 
-        tts_model=os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"),
         default_language=os.getenv("DEFAULT_LANGUAGE", "en"),
         tts_use_gpu=_get_bool("TTS_USE_GPU", False),
-        tts_strip_punctuation=_get_bool("TTS_STRIP_PUNCTUATION", True),
-        tts_max_chars=int(os.getenv("TTS_MAX_CHARS", "200")),
-        tts_workers=int(os.getenv("TTS_WORKERS", "1")),
-        tts_gpu_queue_share=float(os.getenv("TTS_GPU_QUEUE_SHARE", "0.5")),
-        tts_gpu_min_chars=int(os.getenv("TTS_GPU_MIN_CHARS", "160")),
-        tts_batch_max_chars=int(os.getenv("TTS_BATCH_MAX_CHARS", "400")),
+        tts_min_gpu_vram_gb=float(os.getenv("TTS_MIN_GPU_VRAM_GB", "8")),
+        tts_max_chars=int(os.getenv("TTS_MAX_CHARS", "120")),
+        tts_tone=os.getenv("TTS_TONE", "toddler").strip().lower(),
+        tts_tone_cfg_weight=_get_optional_float("TTS_TONE_CFG_WEIGHT"),
+        tts_tone_exaggeration=_get_optional_float("TTS_TONE_EXAGGERATION"),
+        tts_chatterbox_variant=os.getenv("TTS_CHATTERBOX_VARIANT", "turbo").strip().lower(),
+        tts_chunk_silence_ms=int(os.getenv("TTS_CHUNK_SILENCE_MS", "120")),
         chapter_split_keywords=[
             kw.strip()
             for kw in os.getenv(

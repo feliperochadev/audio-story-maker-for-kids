@@ -48,6 +48,7 @@ def cmd_synthesize(args: argparse.Namespace) -> int:
         speaker_wav=args.speaker_wav,
         language=args.language,
         out_dir=args.out_dir,
+        tone=args.tone,
     )
     print("\nCreated MP3 files:")
     for p in created:
@@ -88,6 +89,7 @@ def main() -> int:
     ap_syn.add_argument("--speaker-wav", required=True)
     ap_syn.add_argument("--language", default=None, help="e.g. en, fr, es (default from env DEFAULT_LANGUAGE)")
     ap_syn.add_argument("--out-dir", default="output")
+    ap_syn.add_argument("--tone", default=None, help="Override tone (env TTS_TONE)")
     ap_syn.set_defaults(func=cmd_synthesize)
 
     ap_log = sub.add_parser("login", help="Login to my.tonies.com manually and save a Playwright session")

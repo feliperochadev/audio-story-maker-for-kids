@@ -1,173 +1,174 @@
 from __future__ import annotations
 
+import gc
+import inspect
 import os
+import re
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
+from dotenv import load_dotenv
+import torch
+import torchaudio as ta
 from tqdm import tqdm
-from pydub import AudioSegment
 
-from .text_utils import split_into_chapters, split_for_tts, clean_text, normalize_for_tts
 from .audio_utils import wav_to_mp3
+from .text_utils import split_into_chapters, split_for_tts, clean_text
+from ..config import get_settings
 
-_WORKER_TTS = None
-_WORKER_CONFIG = None
-
-
-def _batch_chunks(chunks: List[str], max_chars: int) -> List[str]:
-    if max_chars <= 0:
-        return chunks
-    batches: List[str] = []
-    current: List[str] = []
-    current_len = 0
-    for chunk in chunks:
-        chunk_len = len(chunk)
-        if not current:
-            current = [chunk]
-            current_len = chunk_len
-            continue
-        if current_len + 1 + chunk_len <= max_chars:
-            current.append(chunk)
-            current_len += 1 + chunk_len
-        else:
-            batches.append(" ".join(current).strip())
-            current = [chunk]
-            current_len = chunk_len
-    if current:
-        batches.append(" ".join(current).strip())
-    return batches
-
-
-def _cache_speaker_embedding(tts, speaker_wav: Path) -> None:
-    manager = getattr(tts.synthesizer.tts_model, "speaker_manager", None)
-    if not manager or not hasattr(manager, "compute_embedding_from_clip"):
+def _log_gpu_stats(label: str) -> None:
+    if not torch.cuda.is_available():
         return
-
-    original_fn = manager.compute_embedding_from_clip
-    cache = {}
-
-    def _key(value):
-        if isinstance(value, (list, tuple)):
-            return tuple(str(v) for v in value)
-        return str(value)
-
-    key = _key(speaker_wav)
-    cache[key] = original_fn(speaker_wav)
-
-    def _cached_compute_embedding_from_clip(value):
-        k = _key(value)
-        if k not in cache:
-            cache[k] = original_fn(value)
-        return cache[k]
-
-    manager.compute_embedding_from_clip = _cached_compute_embedding_from_clip
-
-
-def _synthesize_with_tts(
-    tts,
-    index: int,
-    chunk: str,
-    title: str,
-    speaker_wav: Path,
-    language: str,
-    out_dir: Path,
-    mp3_bitrate: str,
-    output_gain_db: float,
-    silence_min_len_ms: int,
-    silence_keep_ms: int,
-    silence_thresh_db: float,
-    silence_fade_ms: int,
-) -> Path:
-    wav_path = out_dir / f"{title} - Part {index:02d}.wav"
-    mp3_path = out_dir / f"{title} - Part {index:02d}.mp3"
-
-    tts.tts_to_file(
-        text=chunk,
-        speaker_wav=str(speaker_wav),
-        language=language,
-        file_path=str(wav_path),
-    )
-
-    wav_to_mp3(
-        wav_path,
-        mp3_path,
-        bitrate=mp3_bitrate,
-        gain_db=output_gain_db,
-        silence_min_len_ms=silence_min_len_ms,
-        silence_keep_ms=silence_keep_ms,
-        silence_thresh_db=silence_thresh_db,
-        silence_fade_ms=silence_fade_ms,
-    )
-
     try:
-        wav_path.unlink(missing_ok=True)
+        free, total = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        print(
+            f"{label} | cuda mem free={free // (1024 ** 2)}MB "
+            f"total={total // (1024 ** 2)}MB allocated={allocated // (1024 ** 2)}MB "
+            f"reserved={reserved // (1024 ** 2)}MB"
+        )
     except Exception:
         pass
 
-    return mp3_path
+_TONE_TAG_PATTERN = re.compile(r"\[tone\s*:\s*([^\]]+)\]", re.IGNORECASE)
+
+_TONE_PRESETS = {
+    "neutral": {"cfg_weight": 0.5, "exaggeration": 0.5},
+    "calm": {"cfg_weight": 0.4, "exaggeration": 0.4},
+    "gentle": {"cfg_weight": 0.35, "exaggeration": 0.6},
+    "toddler": {"cfg_weight": 0.3, "exaggeration": 0.7},
+    "storybook": {"cfg_weight": 0.3, "exaggeration": 0.7},
+    "dramatic": {"cfg_weight": 0.3, "exaggeration": 0.8},
+}
 
 
-def _prepare_torch_safe_globals():
+def _merge_preface_with_first_chapter(chapters: List[str], chapter_keywords: List[str]) -> List[str]:
+    if len(chapters) < 2:
+        return chapters
+    keywords = [kw.strip() for kw in chapter_keywords if kw.strip()]
+    if not keywords:
+        return chapters
+    pattern = re.compile(rf"(?i)^({'|'.join(re.escape(k) for k in keywords)})\b")
+    first = chapters[0].lstrip()
+    second = chapters[1].lstrip()
+    if pattern.match(first):
+        return chapters
+    if not pattern.match(second):
+        return chapters
+    merged = f"{chapters[0].strip()} ... {chapters[1].strip()}"
+    return [merged] + chapters[2:]
+
+
+def _load_chatterbox_model(variant: str, device: str):
+    if variant == "turbo":
+        try:
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+        except Exception as exc:
+            raise RuntimeError(
+                "Chatterbox Turbo is not available in this installation. "
+                "Install from the GitHub repo to get chatterbox.tts_turbo."
+            ) from exc
+        return ChatterboxTurboTTS.from_pretrained(device=device), "turbo"
+    if variant == "multilingual":
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        return ChatterboxMultilingualTTS.from_pretrained(device=device), "multilingual"
+    from chatterbox.tts import ChatterboxTTS
+    return ChatterboxTTS.from_pretrained(device=device), "english"
+
+def _gpu_meets_vram_requirement(min_vram_gb: float) -> bool:
+    if not torch.cuda.is_available():
+        return False
     try:
-        from torch.serialization import add_safe_globals, safe_globals
-        from TTS.tts.configs.xtts_config import XttsConfig
-        from TTS.tts.models.xtts import XttsAudioConfig
-        from TTS.config.shared_configs import BaseDatasetConfig, BaseAudioConfig, BaseTrainingConfig
+        props = torch.cuda.get_device_properties(0)
+        total_gb = props.total_memory / (1024 ** 3)
+        return total_gb >= min_vram_gb
     except Exception:
-        return None
-
-    safe_globals_list = []
-    for candidate in (XttsConfig, XttsAudioConfig, BaseDatasetConfig, BaseAudioConfig, BaseTrainingConfig):
-        if candidate:
-            safe_globals_list.append(candidate)
-
-    if safe_globals_list:
-        add_safe_globals(safe_globals_list)
-        return safe_globals(safe_globals_list)
-    return None
+        return False
 
 
-def _worker_init(config: dict) -> None:
-    global _WORKER_TTS, _WORKER_CONFIG
-    _WORKER_CONFIG = config
-    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-
-    from TTS.api import TTS
-
-    safe_ctx = _prepare_torch_safe_globals()
-    if safe_ctx:
-        with safe_ctx:
-            _WORKER_TTS = TTS(config["tts_model"], gpu=config["tts_use_gpu"], progress_bar=False)
-    else:
-        _WORKER_TTS = TTS(config["tts_model"], gpu=config["tts_use_gpu"], progress_bar=False)
+from contextlib import contextmanager
 
 
-def _synthesize_chunk(args: tuple[int, str, str]) -> tuple[int, str]:
-    index, chunk, title = args
-    s = _WORKER_CONFIG
+@contextmanager
+def _force_cpu():
+    original_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    original_is_available = torch.cuda.is_available
+    original_device_count = torch.cuda.device_count
+    original_torch_load = torch.load
 
-    out_dir = Path(s["out_dir"]).expanduser().resolve()
-    mp3_path = _synthesize_with_tts(
-        _WORKER_TTS,
-        index=index,
-        chunk=chunk,
-        title=title,
-        speaker_wav=Path(s["speaker_wav"]),
-        language=s["language"],
-        out_dir=out_dir,
-        mp3_bitrate=s["mp3_bitrate"],
-        output_gain_db=s["output_gain_db"],
-        silence_min_len_ms=s["silence_min_len_ms"],
-        silence_keep_ms=s["silence_keep_ms"],
-        silence_thresh_db=s["silence_thresh_db"],
-        silence_fade_ms=s["silence_fade_ms"],
-    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-    return index, str(mp3_path)
-from ..config import get_settings
+    def _false():
+        return False
+
+    def _zero():
+        return 0
+
+    torch.cuda.is_available = _false
+    torch.cuda.device_count = _zero
+
+    def _cpu_load(*args, **kwargs):
+        kwargs.setdefault("map_location", torch.device("cpu"))
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _cpu_load
+
+    try:
+        yield
+    finally:
+        if original_visible is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_visible
+        torch.cuda.is_available = original_is_available
+        torch.cuda.device_count = original_device_count
+        torch.load = original_torch_load
+
+def _resolve_tone_settings(tone: str, settings) -> dict:
+    tone_key = (tone or "").strip().lower()
+    values = _TONE_PRESETS.get(tone_key, _TONE_PRESETS["neutral"]).copy()
+    if settings.tts_tone_cfg_weight is not None:
+        values["cfg_weight"] = settings.tts_tone_cfg_weight
+    if settings.tts_tone_exaggeration is not None:
+        values["exaggeration"] = settings.tts_tone_exaggeration
+    return values
+
+
+def _parse_tone_segments(text: str, default_tone: str) -> List[tuple[str, str]]:
+    segments: List[tuple[str, str]] = []
+    current_tone = default_tone
+    cursor = 0
+    for match in _TONE_TAG_PATTERN.finditer(text):
+        before = text[cursor:match.start()].strip()
+        if before:
+            segments.append((current_tone, before))
+        current_tone = match.group(1).strip().lower()
+        cursor = match.end()
+    tail = text[cursor:].strip()
+    if tail:
+        segments.append((current_tone, tail))
+    return segments
+
+
+def _generate_audio(model, text: str, audio_prompt_path: str | None, language_id: str | None, tone_settings: dict):
+    kwargs = {}
+    if audio_prompt_path:
+        kwargs["audio_prompt_path"] = audio_prompt_path
+    kwargs.update(tone_settings)
+
+    signature = inspect.signature(model.generate)
+    if "language_id" in signature.parameters:
+        if language_id is None and signature.parameters["language_id"].default is inspect._empty:
+            raise ValueError("language_id is required for this model; pass --language or set DEFAULT_LANGUAGE.")
+        if language_id is not None:
+            kwargs["language_id"] = language_id
+    filtered = {k: v for k, v in kwargs.items() if k in signature.parameters}
+    return model.generate(text, **filtered)
+
 
 def synthesize_story_to_mp3s(
     story_text: str,
@@ -175,16 +176,17 @@ def synthesize_story_to_mp3s(
     speaker_wav: str | Path,
     language: Optional[str] = None,
     out_dir: str | Path = "output",
+    tone: Optional[str] = None,
 ) -> List[Path]:
     """
     Voice-clone a story into multiple MP3 chapter files.
     Returns list of created MP3 paths.
     """
-    # Ensure torch loads are not forced into weights_only mode (PyTorch 2.6+).
-    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-
-    from TTS.api import TTS
-
+    load_dotenv()
+    hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+    if hf_token:
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
+        os.environ.setdefault("HF_TOKEN", hf_token)
     s = get_settings()
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -197,40 +199,23 @@ def synthesize_story_to_mp3s(
         max_chars=s.chapter_max_chars,
         chapter_keywords=s.chapter_split_keywords,
     )
-    if s.tts_strip_punctuation:
-        chapters = [normalize_for_tts(clean_text(ch)) for ch in chapters]
+    chapters = _merge_preface_with_first_chapter(chapters, s.chapter_split_keywords)
     if not chapters:
         raise ValueError("Story text is empty after cleaning.")
-
-    safe_globals_context = _prepare_torch_safe_globals()
-
-    # Load model once
-    if safe_globals_context:
-        with safe_globals_context:
-            tts = TTS(s.tts_model, gpu=s.tts_use_gpu, progress_bar=False)
-    else:
-        tts = TTS(s.tts_model, gpu=s.tts_use_gpu, progress_bar=False)
-    print(f"TTS device: {'cuda' if s.tts_use_gpu else 'cpu'}")
 
     speaker_wav = Path(speaker_wav).expanduser().resolve()
     if not speaker_wav.exists():
         raise FileNotFoundError(f"Speaker wav not found: {speaker_wav}")
-    _cache_speaker_embedding(tts, speaker_wav)
+    def is_oom_error(exc: Exception) -> bool:
+        return isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower()
 
-    created: List[Path] = []
-    total = len(chapters)
-    overall_bar = tqdm(total=total, desc="Chapters", unit="chapter")
+    def run_synthesis(model, max_chars: int, variant: str) -> List[Path]:
+        created: List[Path] = []
+        total = len(chapters)
+        overall_bar = tqdm(total=total, desc="Chapters", unit="chapter")
+        tone_default = (tone or s.tts_tone).strip().lower()
+        use_language_id = language if variant in {"multilingual", "turbo"} else None
 
-    if s.tts_workers <= 0:
-        cpu_count = os.cpu_count() or 1
-        workers = max(1, cpu_count - 1)
-    else:
-        workers = max(1, s.tts_workers)
-    if s.tts_use_gpu and workers > 1:
-        print("GPU detected; forcing TTS_WORKERS=1 to avoid contention.")
-        workers = 1
-
-    if workers == 1:
         for i, chapter_text in enumerate(chapters, start=1):
             stop_event = threading.Event()
             chapter_start = time.monotonic()
@@ -251,25 +236,52 @@ def synthesize_story_to_mp3s(
             progress_thread = threading.Thread(target=tick_progress, daemon=True)
             progress_thread.start()
 
-            chapter_chunks = split_for_tts(chapter_text, max_chars=s.tts_max_chars)
-            combined = AudioSegment.empty()
-            for chunk in chapter_chunks:
-                wav_path = out_dir / f"{title} - Chapter {i:02d}.wav"
-                tts.tts_to_file(
-                    text=chunk,
-                    speaker_wav=str(speaker_wav),
-                    language=language,
-                    file_path=str(wav_path),
-                    split_sentences=False,
-                )
-                combined += AudioSegment.from_file(str(wav_path))
-                try:
-                    wav_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            try:
+                segments = _parse_tone_segments(chapter_text, tone_default)
+                combined_text = " ".join(segment for _, segment in segments).strip()
+                combined_text = clean_text(combined_text)
+                if not combined_text:
+                    raise ValueError("Chapter text is empty after cleaning.")
+                print(f"chunk text (chapter {i:02d}): {combined_text}")
+                segment_settings = _resolve_tone_settings(tone_default, s)
+                with torch.inference_mode():
+                    try:
+                        _log_gpu_stats("before generate")
+                        wav = _generate_audio(
+                            model,
+                            text=combined_text,
+                            audio_prompt_path=str(speaker_wav),
+                            language_id=use_language_id,
+                            tone_settings=segment_settings,
+                        )
+                    except Exception as exc:
+                        chunk_len = len(combined_text)
+                        ref_size = speaker_wav.stat().st_size if speaker_wav.exists() else 0
+                        print(
+                            "Chatterbox generate failed. "
+                            f"chunk_len={chunk_len} max_chars={max_chars} "
+                            f"ref_bytes={ref_size} tone={tone_default} variant={variant}"
+                        )
+                        _log_gpu_stats("after failure")
+                        print(traceback.format_exc())
+                        raise exc
+                    if wav.dim() > 1:
+                        wav = wav.squeeze(0)
+                    wav = wav.detach().cpu().float()
+                    model_device = getattr(model, "device", None)
+                    if model_device is not None and str(model_device).startswith("cuda"):
+                        torch.cuda.empty_cache()
+                        gc.collect()
+            except Exception as exc:
+                stop_event.set()
+                progress_thread.join(timeout=1)
+                chapter_bar.close()
+                overall_bar.close()
+                raise exc
 
             chapter_wav = out_dir / f"{title} - Chapter {i:02d}.wav"
-            combined.export(str(chapter_wav), format="wav")
+            ta.save(str(chapter_wav), wav.unsqueeze(0), model.sr)
+
             mp3_path = out_dir / f"{title} - Chapter {i:02d}.mp3"
             wav_to_mp3(
                 chapter_wav,
@@ -292,32 +304,57 @@ def synthesize_story_to_mp3s(
             progress_thread.join(timeout=1)
             chapter_bar.close()
             overall_bar.update(1)
+
+        overall_bar.close()
+        return created
+
+    if s.tts_use_gpu and _gpu_meets_vram_requirement(s.tts_min_gpu_vram_gb):
+        device = "cuda"
     else:
-        worker_config = {
-            "tts_model": s.tts_model,
-            "tts_use_gpu": s.tts_use_gpu,
-            "speaker_wav": str(speaker_wav),
-            "language": language,
-            "out_dir": str(out_dir),
-            "mp3_bitrate": s.mp3_bitrate,
-            "output_gain_db": s.output_gain_db,
-            "silence_min_len_ms": s.silence_min_len_ms,
-            "silence_keep_ms": s.silence_keep_ms,
-            "silence_thresh_db": s.silence_thresh_db,
-            "silence_fade_ms": s.silence_fade_ms,
-        }
-        with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init, initargs=(worker_config,)) as executor:
-            futures = [
-                executor.submit(_synthesize_chunk, (i, chunk, title))
-                for i, chunk in enumerate(chapters, start=1)
-            ]
-            results = []
-            for future in as_completed(futures):
-                results.append(future.result())
-                overall_bar.update(1)
-            results.sort(key=lambda item: item[0])
-            created = [Path(p) for _, p in results]
+        device = "cpu"
+        if s.tts_use_gpu:
+            print(
+                f"GPU VRAM below {s.tts_min_gpu_vram_gb}GB; forcing CPU. "
+                "Increase TTS_MIN_GPU_VRAM_GB or set TTS_USE_GPU=false to silence this."
+            )
+    if s.tts_chatterbox_variant == "turbo":
+        attempts = [
+            ("turbo", device, s.tts_max_chars),
+            ("turbo", "cpu", min(s.tts_max_chars, 160)),
+        ]
+    else:
+        attempts = [
+            (s.tts_chatterbox_variant, device, s.tts_max_chars),
+            (s.tts_chatterbox_variant, "cpu", min(s.tts_max_chars, 160)),
+        ]
 
-    overall_bar.close()
+    seen = set()
+    for variant, attempt_device, max_chars in attempts:
+        key = (variant, attempt_device, max_chars)
+        if key in seen:
+            continue
+        seen.add(key)
+        model = None
+        try:
+            if attempt_device == "cuda":
+                print(f"Loading model (variant={variant}, device=cuda, max_chars={max_chars})")
+                model, variant_used = _load_chatterbox_model(variant, device=attempt_device)
+                print(f"TTS device: {attempt_device} (variant: {variant_used})")
+                return run_synthesis(model, max_chars=max_chars, variant=variant_used)
 
-    return created
+            with _force_cpu():
+                print(f"Loading model (variant={variant}, device=cpu, max_chars={max_chars})")
+                model, variant_used = _load_chatterbox_model(variant, device="cpu")
+                print(f"TTS device: cpu (variant: {variant_used})")
+                return run_synthesis(model, max_chars=max_chars, variant=variant_used)
+        except Exception as exc:
+            if not is_oom_error(exc):
+                raise
+            if attempt_device == "cuda":
+                torch.cuda.empty_cache()
+            if model is not None:
+                del model
+            gc.collect()
+            print(f"CUDA OOM detected. Retrying with lower settings (variant={variant}, device={attempt_device}).")
+
+    raise RuntimeError("Chatterbox failed due to CUDA out of memory even after fallback attempts.")
